@@ -3,6 +3,7 @@
 Usage:
     HA_TOKEN=... python bench/bench_conversation.py --label before --runs 10
     python bench/bench_conversation.py --label before --merge-log copied-ha.log
+    python bench/bench_conversation.py --label after --compare-with before
 
 Writes bench/results/<label>.csv with one row per request. The token is read
 from the HA_TOKEN environment variable and is never written to disk. Response
@@ -97,6 +98,31 @@ def _merge_log(csv_path: Path, log_path: Path) -> None:
     print(f"matched {sum(bool(timings.get(row.get('conversation_id'))) for row in rows)}/{len(rows)} turns")
 
 
+def _compare(current_path: Path, other_path: Path) -> None:
+    def read(path: Path) -> dict[str, tuple[str, str, str]]:
+        with path.open(newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+        result = {}
+        for klass in dict.fromkeys(row["class"] for row in rows):
+            valid = [row for row in rows if row["class"] == klass and row["status"] == "200"]
+            cold = next((float(row["seconds"]) for row in valid if row["run"] == "0"), None)
+            warm = sorted(float(row["seconds"]) for row in valid if int(row["run"]) > 0)
+            result[klass] = (
+                f"{cold:.3f}" if cold is not None else "—",
+                f"{statistics.median(warm):.3f}" if warm else "—",
+                f"{warm[math.ceil(0.9 * len(warm)) - 1]:.3f}" if warm else "—",
+            )
+        return result
+
+    before, after = read(other_path), read(current_path)
+    print("| Class | Before cold | After cold | Before median | After median | Before p90 | After p90 |")
+    print("|---|---:|---:|---:|---:|---:|---:|")
+    for klass in dict.fromkeys((*before, *after)):
+        old = before.get(klass, ("—",) * 3)
+        new = after.get(klass, ("—",) * 3)
+        print(f"| {klass} | {old[0]} | {new[0]} | {old[1]} | {new[1]} | {old[2]} | {new[2]} |")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--label", required=True, help="name of the run, e.g. before or after")
@@ -104,11 +130,15 @@ def main() -> None:
     parser.add_argument("--agent", default="conversation.gigachat")
     parser.add_argument("--base-url", default=os.environ.get("HA_URL", "http://orangepizero2w.lan:8123"))
     parser.add_argument("--merge-log", type=Path, help="merge agent paths and stage times from a copied HA log")
+    parser.add_argument("--compare-with", help="print a before/after table against another label")
     args = parser.parse_args()
 
     out_path = Path(__file__).with_name("results") / f"{args.label}.csv"
     if args.merge_log:
         _merge_log(out_path, args.merge_log)
+        return
+    if args.compare_with:
+        _compare(out_path, out_path.with_name(f"{args.compare_with}.csv"))
         return
 
     token = os.environ.get("HA_TOKEN")
