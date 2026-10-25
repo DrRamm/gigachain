@@ -67,12 +67,12 @@ def _classify(payload: dict) -> str:
     response = payload.get("response", {})
     if response.get("response_type") == "error":
         return "error"
-    if response.get("data", {}).get("success") is not None and response.get("data", {}).get("targets") is not None:
-        return "builtin"
     speech = (response.get("speech", {}).get("plain", {}) or {}).get("speech", "")
+    if not speech:
+        return "builtin"
     if speech in ("Включаю свет.", "Выключаю свет.", "Спокойной ночи."):
         return "normalizer"
-    if response.get("data", {}).get("failed"):
+    if speech in ("Скажи команду без отрицания или исключений.", "Уточни команду."):
         return "clarification"
     return "llm"
 
@@ -103,11 +103,11 @@ def _compare(current_path: Path, other_path: Path) -> None:
         with path.open(newline="", encoding="utf-8") as handle:
             rows = list(csv.DictReader(handle))
         result = {}
-        for klass in dict.fromkeys(row["class"] for row in rows):
-            valid = [row for row in rows if row["class"] == klass and row["status"] == "200"]
+        for case_id in dict.fromkeys(row["case_id"] for row in rows):
+            valid = [row for row in rows if row["case_id"] == case_id and row["status"] == "200"]
             cold = next((float(row["seconds"]) for row in valid if row["run"] == "0"), None)
             warm = sorted(float(row["seconds"]) for row in valid if int(row["run"]) > 0)
-            result[klass] = (
+            result[case_id] = (
                 f"{cold:.3f}" if cold is not None else "—",
                 f"{statistics.median(warm):.3f}" if warm else "—",
                 f"{warm[math.ceil(0.9 * len(warm)) - 1]:.3f}" if warm else "—",
@@ -115,12 +115,13 @@ def _compare(current_path: Path, other_path: Path) -> None:
         return result
 
     before, after = read(other_path), read(current_path)
-    print("| Class | Before cold | After cold | Before median | After median | Before p90 | After p90 |")
+    print("| Phrase | Before cold | After cold | Before median | After median | Before p90 | After p90 |")
     print("|---|---:|---:|---:|---:|---:|---:|")
-    for klass in dict.fromkeys((*before, *after)):
-        old = before.get(klass, ("—",) * 3)
-        new = after.get(klass, ("—",) * 3)
-        print(f"| {klass} | {old[0]} | {new[0]} | {old[1]} | {new[1]} | {old[2]} | {new[2]} |")
+    for case_id in dict.fromkeys((*before, *after)):
+        old = before.get(case_id, ("—",) * 3)
+        new = after.get(case_id, ("—",) * 3)
+        phrase = PHRASES[int(case_id)][1]
+        print(f"| {phrase} | {old[0]} | {new[0]} | {old[1]} | {new[1]} | {old[2]} | {new[2]} |")
 
 
 def main() -> None:
@@ -152,7 +153,7 @@ def main() -> None:
 
     rows: list[dict] = []
     for run in range(args.runs):
-        for klass, phrase, expected in PHRASES:
+        for case_id, (klass, phrase, expected) in enumerate(PHRASES):
             text = phrase
             if "включи свет" in phrase and run % 2:
                 text = phrase.replace("включи", "выключи", 1)
@@ -175,6 +176,7 @@ def main() -> None:
                     "label": args.label,
                     "run": run,
                     "class": klass,
+                    "case_id": case_id,
                     "expected_path": expected,
                     "text": text,
                     "conversation_id": payload.get("conversation_id", ""),
@@ -194,13 +196,13 @@ def main() -> None:
         writer.writerows(rows)
 
     print(f"\nwrote {out_path}")
-    for klass in dict.fromkeys(row["class"] for row in rows):
-        valid = [row for row in rows if row["class"] == klass and row["status"] == 200]
+    for case_id, (klass, phrase, _) in enumerate(PHRASES):
+        valid = [row for row in rows if row["case_id"] == case_id and row["status"] == 200]
         cold = next((row["seconds"] for row in valid if row["run"] == 0), None)
         warm = sorted(row["seconds"] for row in valid if row["run"] > 0)
         if warm:
             p90 = warm[math.ceil(0.9 * len(warm)) - 1]
-            print(f"{klass:<11} cold={cold!s:>5}s median={statistics.median(warm):6.2f}s p90={p90:6.2f}s n={len(warm)}")
+            print(f"{phrase:<35} cold={cold!s:>5}s median={statistics.median(warm):6.2f}s p90={p90:6.2f}s n={len(warm)}")
 
 
 if __name__ == "__main__":
