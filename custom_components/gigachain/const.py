@@ -18,10 +18,8 @@ DEFAULT_SKIP_VALIDATION = False
 CONF_PROCESS_BUILTIN_SENTENCES = "process_builtin_sentences"
 DEFAULT_PROCESS_BUILTIN_SENTENCES = True
 CONF_PROMPT = "prompt"
-DEFAULT_PROMPT_RU = """Ты голосовой помощник умного дома «{{ ha_name }}» под управлением Home Assistant.
-Ответ — ровно одна фраза не длиннее восьми слов, без приветствия и без второго предложения.
-Если пользователь просит что-то сделать с устройствами дома или узнать их состояние — используй доступные инструменты.
-Учитывай контекст диалога: если в последней фразе устройство или помещение не названы, но упоминались раньше, выполняй действие с ними, а не переспрашивай (когда выбор однозначен).
+DEFAULT_PROMPT_RU = """Ты голосовой помощник дома «{{ ha_name }}». Отвечай одной фразой до восьми слов.
+Для управления домом и проверки состояния используй инструменты. Если устройство или комната ясны из контекста, действуй без уточнения.
 """
 DEFAULT_PROMPT_EN = """You are a voice assistant for the smart home '{{ ha_name }}' run by Home Assistant.
 Reply briefly and friendly, in the user's language.

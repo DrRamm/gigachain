@@ -2,9 +2,12 @@
 
 Usage:
     HA_TOKEN=... python bench/bench_conversation.py --label before --runs 10
+    python bench/bench_conversation.py --label before --merge-log copied-ha.log
 
 Writes bench/results/<label>.csv with one row per request. The token is read
-from the HA_TOKEN environment variable and is never written to disk.
+from the HA_TOKEN environment variable and is never written to disk. Response
+paths are guesses until --merge-log matches conversation IDs to agent timing
+lines. The first request per phrase is reported separately from later runs.
 """
 
 from __future__ import annotations
@@ -12,7 +15,9 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
+import re
 import statistics
 import time
 import urllib.error
@@ -48,7 +53,16 @@ def _post(url: str, token: str, body: dict) -> tuple[int, dict]:
         return response.status, json.loads(response.read().decode("utf-8"))
 
 
+TIMING_RE = re.compile(
+    r"gigachain timing: conversation_id=(?P<id>\S+) path=(?P<path>\S+) "
+    r"builtin=(?P<builtin>[\d.]+)s normalizer=(?P<normalizer>[\d.]+)s "
+    r"apply=(?P<apply>[\d.]+)s llm_data=(?P<llm_data>[\d.]+)s "
+    r"llm=(?P<llm>[\d.]+)s total=(?P<total>[\d.]+)s"
+)
+
+
 def _classify(payload: dict) -> str:
+    """Best-effort response classification; use --merge-log for exact paths."""
     response = payload.get("response", {})
     if response.get("response_type") == "error":
         return "error"
@@ -62,13 +76,40 @@ def _classify(payload: dict) -> str:
     return "llm"
 
 
+def _merge_log(csv_path: Path, log_path: Path) -> None:
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    timings = {}
+    for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if match := TIMING_RE.search(line):
+            timings[match["id"]] = match.groupdict()
+    for row in rows:
+        if timing := timings.get(row.get("conversation_id")):
+            row["observed_path"] = timing["path"]
+            row["path_source"] = "agent_log"
+            for stage in ("builtin", "normalizer", "apply", "llm_data", "llm", "total"):
+                row[f"agent_{stage}_seconds"] = timing[stage]
+    fieldnames = list(dict.fromkeys(key for row in rows for key in row))
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"matched {sum(bool(timings.get(row.get('conversation_id'))) for row in rows)}/{len(rows)} turns")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--label", required=True, help="name of the run, e.g. before or after")
     parser.add_argument("--runs", type=int, default=10)
     parser.add_argument("--agent", default="conversation.gigachat")
     parser.add_argument("--base-url", default=os.environ.get("HA_URL", "http://orangepizero2w.lan:8123"))
+    parser.add_argument("--merge-log", type=Path, help="merge agent paths and stage times from a copied HA log")
     args = parser.parse_args()
+
+    out_path = Path(__file__).with_name("results") / f"{args.label}.csv"
+    if args.merge_log:
+        _merge_log(out_path, args.merge_log)
+        return
 
     token = os.environ.get("HA_TOKEN")
     if not token:
@@ -106,9 +147,11 @@ def main() -> None:
                     "class": klass,
                     "expected_path": expected,
                     "text": text,
+                    "conversation_id": payload.get("conversation_id", ""),
                     "status": status,
                     "seconds": round(elapsed, 3),
                     "observed_path": _classify(payload) if payload else "error",
+                    "path_source": "response_guess",
                     "speech": speech,
                     "error": error,
                 }
@@ -121,12 +164,13 @@ def main() -> None:
         writer.writerows(rows)
 
     print(f"\nwrote {out_path}")
-    for klass, _, _ in PHRASES:
-        times = sorted(r["seconds"] for r in rows if r["class"] == klass and r["run"] > 0 and not r["error"])
-        if not times:
-            continue
-        p90 = times[min(len(times) - 1, int(round(0.9 * (len(times) - 1))))]
-        print(f"{klass:<11} median={statistics.median(times):6.2f}s p90={p90:6.2f}s n={len(times)}")
+    for klass in dict.fromkeys(row["class"] for row in rows):
+        valid = [row for row in rows if row["class"] == klass and row["status"] == 200]
+        cold = next((row["seconds"] for row in valid if row["run"] == 0), None)
+        warm = sorted(row["seconds"] for row in valid if row["run"] > 0)
+        if warm:
+            p90 = warm[math.ceil(0.9 * len(warm)) - 1]
+            print(f"{klass:<11} cold={cold!s:>5}s median={statistics.median(warm):6.2f}s p90={p90:6.2f}s n={len(warm)}")
 
 
 if __name__ == "__main__":

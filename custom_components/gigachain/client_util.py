@@ -146,7 +146,7 @@ def _fetch_models(unique_id: str, api_key: str, current: str | None) -> list[str
                 ca_bundle_file=CA_BUNDLE_FILE,
                 timeout=10,
             )
-            ids = [m.id for m in client.get_models().data or []]
+            ids = [m.id_ for m in client.get_models().data or []]
             models = [m for m in ids
                       if not m.lower().startswith(("embeddings", "gigaembeddings"))]
         elif unique_id == UNIQUE_ID_OPENAI:

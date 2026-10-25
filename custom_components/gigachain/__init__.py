@@ -37,11 +37,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         model = entry.options.get(CONF_CHAT_MODEL)
     if engine == ID_GIGACHAT and model in (" ", "", None):
         available = await get_models(hass, entry)
-        model = next((name for name in available if name not in (" ", "")), "GigaChat-2")
+        model = next(
+            (name for name in ("GigaChat-3-Lightning", "GigaChat-2") if name in available),
+            next((name for name in available if name not in (" ", "")), "GigaChat-2"),
+        )
     temperature = entry.options.get(CONF_TEMPERATURE, DEFAULT_TEMPERATURE)
     max_tokens = entry.options.get(CONF_MAX_TOKENS)
-    if max_tokens is None and engine == ID_YANDEX_GPT:
-        max_tokens = DEFAULT_MAX_TOKENS
+    if max_tokens is None:
+        if engine == ID_GIGACHAT:
+            max_tokens = 80
+        elif engine == ID_YANDEX_GPT:
+            max_tokens = DEFAULT_MAX_TOKENS
 
     entry.async_on_unload(entry.add_update_listener(update_listener))
 
