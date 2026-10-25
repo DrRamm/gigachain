@@ -1,4 +1,5 @@
 import logging
+import ssl
 import warnings
 from pathlib import Path
 
@@ -93,7 +94,9 @@ def _get_client(engine, entry, common_args):
     if engine == ID_GIGACHAT:
         common_args["credentials"] = entry.data[CONF_API_KEY]
         common_args["verify_ssl_certs"] = True
-        common_args["ca_bundle_file"] = CA_BUNDLE_FILE
+        # _get_client runs in HA's executor. Build the context here so the
+        # first async request does not load CA certificates on the event loop.
+        common_args["ssl_context"] = ssl.create_default_context(cafile=CA_BUNDLE_FILE)
         common_args["profanity_check"] = entry.options.get(CONF_PROFANITY, DEFAULT_PROFANITY)
         client = GigaChat(**common_args)
     elif engine == ID_YANDEX_GPT:
