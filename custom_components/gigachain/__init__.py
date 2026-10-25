@@ -6,7 +6,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 
-from .client_util import get_client
+from .client_util import get_client, get_models
 from .const import (
     CONF_CHAT_MODEL,
     CONF_CHAT_MODEL_USER,
@@ -35,6 +35,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     model = entry.options.get(CONF_CHAT_MODEL_USER)
     if model in (" ", "", None):
         model = entry.options.get(CONF_CHAT_MODEL)
+    if engine == ID_GIGACHAT and model in (" ", "", None):
+        available = await get_models(hass, entry)
+        model = next((name for name in available if name not in (" ", "")), "GigaChat-2")
     temperature = entry.options.get(CONF_TEMPERATURE, DEFAULT_TEMPERATURE)
     max_tokens = entry.options.get(CONF_MAX_TOKENS)
     if max_tokens is None and engine == ID_YANDEX_GPT:

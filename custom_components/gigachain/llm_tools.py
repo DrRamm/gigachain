@@ -233,9 +233,12 @@ def chat_log_to_langchain(content: list[conversation.Content]) -> list[BaseMessa
             else:
                 messages.append(AIMessage(content=item.content or ""))
         elif isinstance(item, conversation.ToolResultContent):
+            payload = item.tool_result
+            if not isinstance(payload, str):
+                payload = json.dumps(payload, ensure_ascii=False, default=str)
             messages.append(
                 ToolMessage(
-                    content=json.dumps(item.result.data, ensure_ascii=False),
+                    content=payload,
                     tool_call_id=item.tool_call_id,
                     name=item.tool_name,
                 )

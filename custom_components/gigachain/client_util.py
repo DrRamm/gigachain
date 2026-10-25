@@ -1,5 +1,6 @@
 import logging
 import warnings
+from pathlib import Path
 
 from homeassistant.core import HomeAssistant
 from langchain_community.chat_models import ChatAnyscale, ChatYandexGPT
@@ -29,6 +30,7 @@ from .const import (
 )
 
 LOGGER = logging.getLogger(__name__)
+CA_BUNDLE_FILE = str(Path(__file__).with_name("russian_trusted_root_ca_pem.crt"))
 
 warnings.filterwarnings(
     "ignore",
@@ -49,13 +51,15 @@ async def validate_client(
 def _validate_client(user_input) -> None:
     engine = user_input.get(CONF_ENGINE) or ID_GIGACHAT
     if engine == ID_GIGACHAT:
-        credentials = user_input[CONF_API_KEY]
-        client = GigaChat(
-            max_tokens=10,
-            verbose=False,
-            credentials=credentials,
-            verify_ssl_certs=False,
+        from gigachat import GigaChat as GigaChatSDK
+
+        client = GigaChatSDK(
+            credentials=user_input[CONF_API_KEY],
+            verify_ssl_certs=True,
+            ca_bundle_file=CA_BUNDLE_FILE,
         )
+        client.get_models()
+        return
     elif engine == ID_YANDEX_GPT:
         client = ChatYandexGPT(
             max_tokens=10,
@@ -88,7 +92,8 @@ async def get_client(hass: HomeAssistant, engine, entry, common_args):
 def _get_client(engine, entry, common_args):
     if engine == ID_GIGACHAT:
         common_args["credentials"] = entry.data[CONF_API_KEY]
-        common_args["verify_ssl_certs"] = False
+        common_args["verify_ssl_certs"] = True
+        common_args["ca_bundle_file"] = CA_BUNDLE_FILE
         common_args["profanity_check"] = entry.options.get(CONF_PROFANITY, DEFAULT_PROFANITY)
         client = GigaChat(**common_args)
     elif engine == ID_YANDEX_GPT:
@@ -135,7 +140,12 @@ def _fetch_models(unique_id: str, api_key: str, current: str | None) -> list[str
     try:
         if unique_id == UNIQUE_ID_GIGACHAT:
             from gigachat import GigaChat
-            client = GigaChat(credentials=api_key, verify_ssl_certs=False, timeout=10)
+            client = GigaChat(
+                credentials=api_key,
+                verify_ssl_certs=True,
+                ca_bundle_file=CA_BUNDLE_FILE,
+                timeout=10,
+            )
             ids = [m.id for m in client.get_models().data or []]
             models = [m for m in ids
                       if not m.lower().startswith(("embeddings", "gigaembeddings"))]

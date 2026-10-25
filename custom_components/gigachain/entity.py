@@ -28,6 +28,9 @@ from homeassistant.helpers import (
     template,
 )
 
+from custom_components.voice_normalizer.conversation import async_apply_result
+from custom_components.voice_normalizer.normalizer import normalize as normalize_local_lights
+
 from . import geo, llm_tools
 from .const import (
     CONF_ENGINE,
@@ -101,15 +104,61 @@ class GigaChatAgent(conversation.ConversationEntity):
             # sentence we roll back whatever it appended (e.g. the "not
             # understood" speech) before consulting the LLM.
             content_snapshot = len(chat_log.content)
-            default_agent_response = await default_agent._async_handle_message(
-                user_input, chat_log
+            default_agent_response = None
+            try:
+                default_agent_response = await default_agent._async_handle_message(
+                    user_input, chat_log
+                )
+            except Exception:
+                del chat_log.content[content_snapshot:]
+                if "погод" not in (user_input.text or "").lower():
+                    raise
+            if (
+                default_agent_response is not None
+                and default_agent_response.response.intent
+            ):
+                intent_response = default_agent_response.response
+                if intent_response.response_type == intent.IntentResponseType.ERROR:
+                    # A matched sentence whose reply template failed, for example
+                    # "погода через три часа" caught by HassStartTimer. Let the
+                    # model answer instead of speaking the template error.
+                    del chat_log.content[content_snapshot:]
+                else:
+                    intent_obj = intent_response.intent
+                    text_l = (user_input.text or "").lower()
+                    if intent_obj.intent_type == "HassStartTimer" and "погод" in text_l:
+                        del chat_log.content[content_snapshot:]
+                    else:
+                        if (
+                            intent_obj.intent_type in {"HassTurnOn", "HassTurnOff"}
+                            and intent_response.response_type == intent.IntentResponseType.ACTION_DONE
+                        ):
+                            intent_response.speech.clear()
+                        return conversation.ConversationResult(
+                            conversation_id=chat_log.conversation_id,
+                            response=intent_response,
+                        )
+            del chat_log.content[content_snapshot:]
+
+            local_result = normalize_local_lights(user_input.text)
+            speech = await async_apply_result(
+                self.hass, local_result, user_input.context, user_input.satellite_id
             )
-            if default_agent_response.response.intent:
+            clarification = local_result["clarification"]
+            if speech:
+                local_response = intent.IntentResponse(language=user_input.language)
+                local_response.async_set_speech(speech)
                 return conversation.ConversationResult(
                     conversation_id=chat_log.conversation_id,
-                    response=default_agent_response.response,
+                    response=local_response,
                 )
-            del chat_log.content[content_snapshot:]
+            if local_result.get("room") or clarification == "Скажи команду без отрицания или исключений.":
+                local_response = intent.IntentResponse(language=user_input.language)
+                local_response.async_set_speech(clarification or "Уточни команду.")
+                return conversation.ConversationResult(
+                    conversation_id=chat_log.conversation_id,
+                    response=local_response,
+                )
 
         try:
             await chat_log.async_provide_llm_data(
@@ -166,12 +215,12 @@ class GigaChatAgent(conversation.ConversationEntity):
                 result = await self.hass.async_add_executor_job(
                     bound_client.invoke, messages
                 )
-            except Exception as err:
+            except Exception:
                 LOGGER.exception("Error invoking LLM")
                 chat_log.async_add_assistant_content_without_tools(
                     conversation.AssistantContent(
                         agent_id=self.entity_id,
-                        content=f"Извини, произошла ошибка при обращении к модели: {err}",
+                        content="Не удалось связаться с GigaChat.",
                     )
                 )
                 return
@@ -219,7 +268,7 @@ class GigaChatAgent(conversation.ConversationEntity):
                             agent_id=self.entity_id,
                             tool_call_id=tool_call.id,
                             tool_name=tool_call.tool_name,
-                            result=llm.ToolResult(data=location),
+                            tool_result=location,
                         )
                     )
                 continue
@@ -264,12 +313,12 @@ class GigaChatAgent(conversation.ConversationEntity):
             messages = llm_tools.chat_log_to_langchain(chat_log.content)
             try:
                 result = await self.hass.async_add_executor_job(client.invoke, messages)
-            except Exception as err:
+            except Exception:
                 LOGGER.exception("Error invoking LLM")
                 chat_log.async_add_assistant_content_without_tools(
                     conversation.AssistantContent(
                         agent_id=self.entity_id,
-                        content=f"Извини, произошла ошибка при обращении к модели: {err}",
+                        content="Не удалось связаться с GigaChat.",
                     )
                 )
                 return
