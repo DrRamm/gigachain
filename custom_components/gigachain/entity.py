@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from typing import Literal
 
 from home_assistant_intents import get_languages
@@ -53,6 +54,18 @@ LOGGER = logging.getLogger(__name__)
 
 MAX_TOOL_ITERATIONS = 10
 
+
+def _log_timing(path: str, started: float, llm_started: float | None = None) -> None:
+    """Log how long one conversation turn took and which path answered it."""
+    total = time.monotonic() - started
+    if llm_started is None:
+        LOGGER.info("gigachain timing: path=%s total=%.3fs", path, total)
+    else:
+        LOGGER.info(
+            "gigachain timing: path=%s total=%.3fs llm=%.3fs",
+            path, total, time.monotonic() - llm_started,
+        )
+
 FUNCTION_CALL_MARKER = re.compile(r'\{\s*"function_call"')
 
 
@@ -89,6 +102,7 @@ class GigaChatAgent(conversation.ConversationEntity):
         chat_log: conversation.ChatLog,
     ) -> conversation.ConversationResult:
         """Process a message."""
+        started = time.monotonic()
         engine = self.entry.data.get(CONF_ENGINE) or ID_GIGACHAT
         llm_api_id = self._async_get_llm_api_id()
 
@@ -134,6 +148,7 @@ class GigaChatAgent(conversation.ConversationEntity):
                             and intent_response.response_type == intent.IntentResponseType.ACTION_DONE
                         ):
                             intent_response.speech.clear()
+                        _log_timing("builtin", started)
                         return conversation.ConversationResult(
                             conversation_id=chat_log.conversation_id,
                             response=intent_response,
@@ -146,6 +161,7 @@ class GigaChatAgent(conversation.ConversationEntity):
             )
             clarification = local_result["clarification"]
             if speech:
+                _log_timing("normalizer", started)
                 local_response = intent.IntentResponse(language=user_input.language)
                 local_response.async_set_speech(speech)
                 return conversation.ConversationResult(
@@ -171,11 +187,13 @@ class GigaChatAgent(conversation.ConversationEntity):
             return err.as_conversation_result()
 
         client = self.entry.runtime_data
+        llm_started = time.monotonic()
         if engine == ID_YANDEX_GPT:
             await self._async_chat_with_prompt_functions(client, chat_log, user_input.language)
         else:
             await self._async_chat_with_tools(client, chat_log, user_input.language)
 
+        _log_timing("llm", started, llm_started)
         return conversation.async_get_result_from_chat_log(user_input, chat_log)
 
     def _async_get_llm_api_id(self) -> str | None:
