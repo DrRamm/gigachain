@@ -61,6 +61,7 @@ LOCAL_COMMAND_HINT = re.compile(
     r"свет|освещ|ламп|подсвет|включ|выключ|заж|погас|потуш|пагас|патуш|сп[оа]койн|добр.*ноч",
     re.IGNORECASE,
 )
+FAST_LOCAL_HINT = re.compile(r"\b(?:не|нельзя|кроме|патуш\w*|пагас\w*)\b", re.IGNORECASE)
 
 
 def _log_timing(
@@ -120,6 +121,31 @@ class GigaChatAgent(conversation.ConversationEntity):
         use_builtin_sentences = self.entry.options.get(
             CONF_PROCESS_BUILTIN_SENTENCES, DEFAULT_PROCESS_BUILTIN_SENTENCES
         )
+        early_local_result = None
+        if use_builtin_sentences and FAST_LOCAL_HINT.search(user_input.text or ""):
+            early_local_result = self._normalize_local_lights(user_input.text, stages)
+            clarification = early_local_result["clarification"]
+            if clarification == "Скажи команду без отрицания или исключений.":
+                _log_timing("clarification", started, stages, chat_log.conversation_id)
+                response = intent.IntentResponse(language=user_input.language)
+                response.async_set_speech(clarification)
+                return conversation.ConversationResult(
+                    conversation_id=chat_log.conversation_id, response=response
+                )
+            if early_local_result.get("entities"):
+                stage_started = time.monotonic()
+                speech = await async_apply_result(
+                    self.hass, early_local_result, user_input.context,
+                    user_input.satellite_id,
+                )
+                stages["apply"] = time.monotonic() - stage_started
+                if speech:
+                    _log_timing("normalizer", started, stages, chat_log.conversation_id)
+                    response = intent.IntentResponse(language=user_input.language)
+                    response.async_set_speech(speech)
+                    return conversation.ConversationResult(
+                        conversation_id=chat_log.conversation_id, response=response
+                    )
         if use_builtin_sentences:
             stage_started = time.monotonic()
             default_agent = agent_manager.async_get_agent(self.hass, None)
@@ -170,18 +196,9 @@ class GigaChatAgent(conversation.ConversationEntity):
             del chat_log.content[content_snapshot:]
 
             if LOCAL_COMMAND_HINT.search(user_input.text or ""):
-                stage_started = time.monotonic()
-                available = {
-                    entity_id for entity_id in (*LIGHTS, *GLOBAL_LIGHTS)
-                    if (state := self.hass.states.get(entity_id)) is not None
-                    and state.state not in ("unavailable", "unknown")
-                }
-                local_result = normalize_local_lights(
-                    user_input.text,
-                    default_room=_room_for_assistant(self.hass),
-                    available_entities=available,
+                local_result = early_local_result or self._normalize_local_lights(
+                    user_input.text, stages
                 )
-                stages["normalizer"] = time.monotonic() - stage_started
                 stage_started = time.monotonic()
                 speech = (
                     await async_apply_result(
@@ -230,6 +247,22 @@ class GigaChatAgent(conversation.ConversationEntity):
 
         _log_timing(path, started, stages, chat_log.conversation_id)
         return conversation.async_get_result_from_chat_log(user_input, chat_log)
+
+    def _normalize_local_lights(self, text: str, stages: dict[str, float]) -> dict:
+        """Parse only currently available allowlisted lights."""
+        stage_started = time.monotonic()
+        available = {
+            entity_id for entity_id in (*LIGHTS, *GLOBAL_LIGHTS)
+            if (state := self.hass.states.get(entity_id)) is not None
+            and state.state not in ("unavailable", "unknown")
+        }
+        result = normalize_local_lights(
+            text,
+            default_room=_room_for_assistant(self.hass),
+            available_entities=available,
+        )
+        stages["normalizer"] = stages.get("normalizer", 0.0) + time.monotonic() - stage_started
+        return result
 
     def _async_get_llm_api_id(self) -> str | None:
         """Return the HA LLM API to use, or None for a plain chat."""
