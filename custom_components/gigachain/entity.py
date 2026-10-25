@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import re
@@ -58,7 +57,10 @@ from .const import (
 LOGGER = logging.getLogger(__name__)
 
 MAX_TOOL_ITERATIONS = 10
-LLM_HEDGE_DELAY = 0.125
+LOCAL_COMMAND_HINT = re.compile(
+    r"свет|освещ|ламп|подсвет|включ|выключ|заж|погас|потуш|пагас|патуш|сп[оа]койн|добр.*ноч",
+    re.IGNORECASE,
+)
 
 
 def _log_timing(
@@ -68,8 +70,9 @@ def _log_timing(
     LOGGER.info(
         "gigachain timing: conversation_id=%s path=%s builtin=%.3fs normalizer=%.3fs "
         "apply=%.3fs llm_data=%.3fs llm=%.3fs total=%.3fs",
-        conversation_id, path, *(stages.get(name, 0.0) for name in
-                ("builtin", "normalizer", "apply", "llm_data", "llm")),
+        conversation_id, path,
+        *(stages.get(name, 0.0) for name in
+          ("builtin", "normalizer", "apply", "llm_data", "llm")),
         time.monotonic() - started,
     )
 
@@ -117,59 +120,6 @@ class GigaChatAgent(conversation.ConversationEntity):
         use_builtin_sentences = self.entry.options.get(
             CONF_PROCESS_BUILTIN_SENTENCES, DEFAULT_PROCESS_BUILTIN_SENTENCES
         )
-        # Parse before the first await. This lets us avoid preparing or sending
-        # an LLM request for commands the normalizer can answer confidently.
-        local_result = None
-        if use_builtin_sentences:
-            stage_started = time.monotonic()
-            available = {
-                entity_id for entity_id in (*LIGHTS, *GLOBAL_LIGHTS)
-                if (state := self.hass.states.get(entity_id)) is not None
-                and state.state not in ("unavailable", "unknown")
-            }
-            local_result = normalize_local_lights(
-                user_input.text,
-                default_room=_room_for_assistant(self.hass),
-                available_entities=available,
-            )
-            stages["normalizer"] = time.monotonic() - stage_started
-
-        speculative: asyncio.Task | None = None
-        bound_client = None
-        llm_snapshot = None
-        llm_data_ready = False
-        if engine == ID_GIGACHAT and use_builtin_sentences and not (
-            local_result and (local_result.get("entities") or local_result.get("scene")
-                              or local_result.get("room")
-                              or local_result.get("clarification") == "Скажи команду без отрицания или исключений.")
-        ):
-            try:
-                llm_snapshot = (
-                    chat_log.content[0], chat_log.llm_api,
-                    chat_log.llm_input_provided_index,
-                    chat_log.extra_system_prompt,
-                )
-                stage_started = time.monotonic()
-                await chat_log.async_provide_llm_data(
-                    user_input.as_llm_context(DOMAIN), llm_api_id,
-                    self._user_prompt(engine, user_input.language),
-                    user_input.extra_system_prompt,
-                )
-                stages["llm_data"] = time.monotonic() - stage_started
-                llm_data_ready = True
-            except conversation.ConverseError as err:
-                return err.as_conversation_result()
-            try:
-                bound_client = self._bind_tools(self.entry.runtime_data, chat_log)
-                # The built-in agent may append while this request is in flight.
-                messages = llm_tools.chat_log_to_langchain(list(chat_log.content))
-            except Exception:
-                LOGGER.exception("Error preparing speculative LLM request")
-            else:
-                speculative = asyncio.create_task(
-                    self._delayed_invoke(bound_client, messages, stages)
-                )
-
         if use_builtin_sentences:
             stage_started = time.monotonic()
             default_agent = agent_manager.async_get_agent(self.hass, None)
@@ -188,8 +138,6 @@ class GigaChatAgent(conversation.ConversationEntity):
             except Exception:
                 del chat_log.content[content_snapshot:]
                 if "погод" not in (user_input.text or "").lower():
-                    await self._cancel_speculative(speculative)
-                    self._restore_llm_snapshot(chat_log, llm_snapshot)
                     raise
             finally:
                 stages["builtin"] = time.monotonic() - stage_started
@@ -214,8 +162,6 @@ class GigaChatAgent(conversation.ConversationEntity):
                             and intent_response.response_type == intent.IntentResponseType.ACTION_DONE
                         ):
                             intent_response.speech.clear()
-                        await self._cancel_speculative(speculative)
-                        self._restore_llm_snapshot(chat_log, llm_snapshot)
                         _log_timing("builtin", started, stages, chat_log.conversation_id)
                         return conversation.ConversationResult(
                             conversation_id=chat_log.conversation_id,
@@ -223,8 +169,20 @@ class GigaChatAgent(conversation.ConversationEntity):
                         )
             del chat_log.content[content_snapshot:]
 
-            stage_started = time.monotonic()
-            try:
+            if LOCAL_COMMAND_HINT.search(user_input.text or ""):
+                stage_started = time.monotonic()
+                available = {
+                    entity_id for entity_id in (*LIGHTS, *GLOBAL_LIGHTS)
+                    if (state := self.hass.states.get(entity_id)) is not None
+                    and state.state not in ("unavailable", "unknown")
+                }
+                local_result = normalize_local_lights(
+                    user_input.text,
+                    default_room=_room_for_assistant(self.hass),
+                    available_entities=available,
+                )
+                stages["normalizer"] = time.monotonic() - stage_started
+                stage_started = time.monotonic()
                 speech = (
                     await async_apply_result(
                         self.hass, local_result, user_input.context,
@@ -233,44 +191,31 @@ class GigaChatAgent(conversation.ConversationEntity):
                     if local_result.get("entities") or local_result.get("scene")
                     else None
                 )
-            except BaseException:
-                await self._cancel_speculative(speculative)
-                self._restore_llm_snapshot(chat_log, llm_snapshot)
-                raise
-            stages["apply"] = time.monotonic() - stage_started
-            clarification = local_result["clarification"]
-            if speech:
-                await self._cancel_speculative(speculative)
-                self._restore_llm_snapshot(chat_log, llm_snapshot)
-                _log_timing("normalizer", started, stages, chat_log.conversation_id)
-                local_response = intent.IntentResponse(language=user_input.language)
-                local_response.async_set_speech(speech)
-                return conversation.ConversationResult(
-                    conversation_id=chat_log.conversation_id,
-                    response=local_response,
-                )
-            if local_result.get("room") or clarification == "Скажи команду без отрицания или исключений.":
-                await self._cancel_speculative(speculative)
-                self._restore_llm_snapshot(chat_log, llm_snapshot)
-                _log_timing("clarification", started, stages, chat_log.conversation_id)
-                local_response = intent.IntentResponse(language=user_input.language)
-                local_response.async_set_speech(clarification or "Уточни команду.")
-                return conversation.ConversationResult(
-                    conversation_id=chat_log.conversation_id,
-                    response=local_response,
-                )
+                stages["apply"] = time.monotonic() - stage_started
+                clarification = local_result["clarification"]
+                if speech or local_result.get("room") or clarification == "Скажи команду без отрицания или исключений.":
+                    _log_timing(
+                        "normalizer" if speech else "clarification",
+                        started, stages, chat_log.conversation_id,
+                    )
+                    local_response = intent.IntentResponse(language=user_input.language)
+                    local_response.async_set_speech(speech or clarification or "Уточни команду.")
+                    return conversation.ConversationResult(
+                        conversation_id=chat_log.conversation_id,
+                        response=local_response,
+                    )
 
-        if not llm_data_ready:
-            try:
-                stage_started = time.monotonic()
-                await chat_log.async_provide_llm_data(
-                    user_input.as_llm_context(DOMAIN), llm_api_id,
-                    self._user_prompt(engine, user_input.language),
-                    user_input.extra_system_prompt,
-                )
-                stages["llm_data"] = time.monotonic() - stage_started
-            except conversation.ConverseError as err:
-                return err.as_conversation_result()
+        try:
+            stage_started = time.monotonic()
+            await chat_log.async_provide_llm_data(
+                user_input.as_llm_context(DOMAIN),
+                llm_api_id,
+                self._user_prompt(engine, user_input.language),
+                user_input.extra_system_prompt,
+            )
+            stages["llm_data"] = time.monotonic() - stage_started
+        except conversation.ConverseError as err:
+            return err.as_conversation_result()
 
         client = self.entry.runtime_data
         if engine == ID_YANDEX_GPT:
@@ -280,8 +225,7 @@ class GigaChatAgent(conversation.ConversationEntity):
             path = "llm"
         else:
             path = await self._async_chat_with_tools(
-                client, chat_log, user_input.language,
-                bound_client=bound_client, first_result=speculative, stages=stages,
+                client, chat_log, user_input.language, stages
             )
 
         _log_timing(path, started, stages, chat_log.conversation_id)
@@ -306,69 +250,25 @@ class GigaChatAgent(conversation.ConversationEntity):
         return (DEFAULT_PROMPT_RU if (language or "").lower().startswith("ru")
                 else DEFAULT_PROMPT_EN)
 
-    def _bind_tools(self, client, chat_log: conversation.ChatLog):
-        """Build the tool schema once for this turn."""
-        tools = [llm_tools.location_tool_to_langchain()]
-        if chat_log.llm_api is not None and chat_log.llm_api.tools:
-            tools = llm_tools.hass_tools_to_langchain(chat_log.llm_api) + tools
-        return client.bind_tools(tools)
-
-    @staticmethod
-    def _restore_llm_snapshot(chat_log: conversation.ChatLog, snapshot) -> None:
-        if snapshot is None:
-            return
-        (chat_log.content[0], chat_log.llm_api,
-         chat_log.llm_input_provided_index,
-         chat_log.extra_system_prompt) = snapshot
-
-    @staticmethod
-    async def _delayed_invoke(bound_client, messages, stages: dict[str, float]):
-        await asyncio.sleep(LLM_HEDGE_DELAY)
-        started = time.monotonic()
-        try:
-            return await bound_client.ainvoke(messages)
-        finally:
-            stages["llm"] = stages.get("llm", 0.0) + time.monotonic() - started
-
-    @staticmethod
-    async def _cancel_speculative(task: asyncio.Task | None) -> None:
-        if task is None:
-            return
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            # The request may have failed just before the local answer won.
-            LOGGER.debug("Speculative LLM request failed after local answer", exc_info=True)
-
     async def _async_chat_with_tools(
         self,
         client,
         chat_log: conversation.ChatLog,
         language: str | None,
-        *,
-        bound_client=None,
-        first_result: asyncio.Task | None = None,
         stages: dict[str, float],
     ) -> str:
         """Generate an answer, letting the model call HA tools natively."""
-        if bound_client is None:
-            bound_client = self._bind_tools(client, chat_log)
+        tools = [llm_tools.location_tool_to_langchain()]
+        if chat_log.llm_api is not None and chat_log.llm_api.tools:
+            tools = llm_tools.hass_tools_to_langchain(chat_log.llm_api) + tools
+        bound_client = client.bind_tools(tools)
         used_tool = False
 
-        for iteration in range(MAX_TOOL_ITERATIONS):
+        for _ in range(MAX_TOOL_ITERATIONS):
+            messages = llm_tools.chat_log_to_langchain(chat_log.content)
+            llm_started = time.monotonic()
             try:
-                if iteration == 0 and first_result is not None:
-                    result = await first_result
-                else:
-                    messages = llm_tools.chat_log_to_langchain(chat_log.content)
-                    llm_started = time.monotonic()
-                    try:
-                        result = await bound_client.ainvoke(messages)
-                    finally:
-                        stages["llm"] = stages.get("llm", 0.0) + time.monotonic() - llm_started
+                result = await bound_client.ainvoke(messages)
             except Exception:
                 LOGGER.exception("Error invoking LLM")
                 chat_log.async_add_assistant_content_without_tools(
@@ -378,6 +278,8 @@ class GigaChatAgent(conversation.ConversationEntity):
                     )
                 )
                 return "llm_tool" if used_tool else "llm"
+            finally:
+                stages["llm"] = stages.get("llm", 0.0) + time.monotonic() - llm_started
             content = llm_tools.ai_message_to_assistant_content(
                 self.entity_id, result
             )

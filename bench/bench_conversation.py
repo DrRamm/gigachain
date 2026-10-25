@@ -28,11 +28,9 @@ from pathlib import Path
 # (class, phrase, expected path). Light phrases alternate on/off below so the
 # lights do not drift from one run to the next.
 PHRASES: list[tuple[str, str, str]] = [
-    ("builtin", "включи свет на кухне", "builtin"),
-    ("builtin", "выключи свет на кухне", "builtin"),
-    ("normalizer", "выключи свет в спальне", "normalizer"),
-    ("normalizer", "спокойной ночи", "normalizer"),
-    ("negation", "включи свет, кроме кухни", "clarification"),
+    ("builtin", "включи свет в коридоре", "builtin"),
+    ("builtin", "выключи свет в коридоре", "builtin"),
+    ("normalizer", "выключи свет в гардеробной", "normalizer"),
     ("llm_short", "сколько будет два плюс два", "llm"),
     ("llm_tool", "какая погода в Гомеле", "llm_tool"),
     ("llm_border", "погода через три часа", "llm"),
@@ -103,11 +101,11 @@ def _compare(current_path: Path, other_path: Path) -> None:
         with path.open(newline="", encoding="utf-8") as handle:
             rows = list(csv.DictReader(handle))
         result = {}
-        for case_id in dict.fromkeys(row["case_id"] for row in rows):
-            valid = [row for row in rows if row["case_id"] == case_id and row["status"] == "200"]
+        for phrase in dict.fromkeys(row["case_phrase"] for row in rows):
+            valid = [row for row in rows if row["case_phrase"] == phrase and row["status"] == "200"]
             cold = next((float(row["seconds"]) for row in valid if row["run"] == "0"), None)
             warm = sorted(float(row["seconds"]) for row in valid if int(row["run"]) > 0)
-            result[case_id] = (
+            result[phrase] = (
                 f"{cold:.3f}" if cold is not None else "—",
                 f"{statistics.median(warm):.3f}" if warm else "—",
                 f"{warm[math.ceil(0.9 * len(warm)) - 1]:.3f}" if warm else "—",
@@ -117,10 +115,9 @@ def _compare(current_path: Path, other_path: Path) -> None:
     before, after = read(other_path), read(current_path)
     print("| Phrase | Before cold | After cold | Before median | After median | Before p90 | After p90 |")
     print("|---|---:|---:|---:|---:|---:|---:|")
-    for case_id in dict.fromkeys((*before, *after)):
-        old = before.get(case_id, ("—",) * 3)
-        new = after.get(case_id, ("—",) * 3)
-        phrase = PHRASES[int(case_id)][1]
+    for phrase in dict.fromkeys((*before, *after)):
+        old = before.get(phrase, ("—",) * 3)
+        new = after.get(phrase, ("—",) * 3)
         print(f"| {phrase} | {old[0]} | {new[0]} | {old[1]} | {new[1]} | {old[2]} | {new[2]} |")
 
 
@@ -177,6 +174,7 @@ def main() -> None:
                     "run": run,
                     "class": klass,
                     "case_id": case_id,
+                    "case_phrase": phrase,
                     "expected_path": expected,
                     "text": text,
                     "conversation_id": payload.get("conversation_id", ""),
